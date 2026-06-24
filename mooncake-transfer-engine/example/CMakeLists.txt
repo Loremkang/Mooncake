@@ -16,6 +16,10 @@ if(USE_TENT)
   target_compile_definitions(transfer_engine_bench PRIVATE USE_TENT)
 endif()
 
+add_executable(pclab_host_tcp_incast_bench
+               ${WORKSPACE}/pclab_host_tcp_incast_bench.cpp)
+target_link_libraries(pclab_host_tcp_incast_bench PUBLIC transfer_engine)
+
 add_executable(transfer_engine_validator
                ${WORKSPACE}/transfer_engine_validator.cpp)
 target_link_libraries(transfer_engine_validator PUBLIC transfer_engine)
@@ -56,6 +60,12 @@ if(USE_ASCEND_HETEROGENEOUS)
     ${WORKSPACE}/transfer_engine_heterogeneous_ascend_perf_initiator.cpp)
   target_link_libraries(transfer_engine_heterogeneous_ascend_perf_initiator
                         PUBLIC transfer_engine)
+endif()
+
+if(USE_ASCEND_TCP_TRANSPORT)
+  add_executable(pclab_ascend_tcp_hbm_bench
+                 ${WORKSPACE}/pclab_ascend_tcp_hbm_bench.cpp)
+  target_link_libraries(pclab_ascend_tcp_hbm_bench PUBLIC transfer_engine)
 endif()
 
 if(USE_UBSHMEM)

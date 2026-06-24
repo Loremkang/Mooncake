@@ -1130,6 +1130,14 @@ PYBIND11_MODULE(engine, m) {
         py::class_<TransferEnginePy>(m, "TransferEngine")
             .def(py::init<>())
             .def("initialize", &TransferEnginePy::initialize)
+            .def("initialize",
+                 [](TransferEnginePy& self, const char* local_hostname,
+                    const char* metadata_server, const char* protocol,
+                    const char* device_name, const char* mode) {
+                     (void)mode;
+                     return self.initialize(local_hostname, metadata_server,
+                                            protocol, device_name);
+                 })
             .def("initialize_ext", &TransferEnginePy::initializeExt)
             .def("get_rpc_port", &TransferEnginePy::getRpcPort)
             .def("allocate_managed_buffer",

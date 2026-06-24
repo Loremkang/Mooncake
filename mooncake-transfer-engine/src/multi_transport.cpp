@@ -38,6 +38,9 @@
 #ifdef USE_ASCEND_HETEROGENEOUS
 #include "transport/ascend_transport/heterogeneous_rdma_transport.h"
 #endif
+#ifdef USE_ASCEND_TCP_TRANSPORT
+#include "transport/ascend_transport/ascend_tcp_transport.h"
+#endif
 #ifdef USE_INTRA_NVLINK
 #include "transport/intranode_nvlink_transport/intranode_nvlink_transport.h"
 #endif
@@ -347,6 +350,11 @@ Transport* MultiTransport::installTransport(const std::string& proto,
         transport = new HeterogeneousRdmaTransport();
     }
 #endif
+#ifdef USE_ASCEND_TCP_TRANSPORT
+    else if (std::string(proto) == "ascend_tcp") {
+        transport = new AscendTcpTransport();
+    }
+#endif
 
 #ifdef USE_INTRA_NVLINK
     else if (std::string(proto) == "nvlink_intra") {
@@ -455,6 +463,15 @@ Status MultiTransport::selectTransport(const TransferRequest& entry,
         proto = "ascend";
     }
 #endif
+#ifdef USE_ASCEND_TCP_TRANSPORT
+    // When USE_ASCEND_TCP_TRANSPORT is enabled:
+    // - Target side directly reuses TCP Transport and publishes protocol "tcp"
+    // - Initiator side uses AscendTcpTransport to stage Ascend HBM to host
+    if (target_segment_desc->protocol == "tcp" &&
+        transport_map_.count("ascend_tcp")) {
+        proto = "ascend_tcp";
+    }
+#endif
     if (!transport_map_.count(proto)) {
         return Status::NotSupportedTransport("Transport " + proto +
                                              " not installed");
@@ -489,10 +506,26 @@ Status MultiTransport::mp_selectTransport(const TransferRequest& entry,
         preferred_proto = "ascend";
     }
 #endif
+#ifdef USE_ASCEND_TCP_TRANSPORT
+    // When USE_ASCEND_TCP_TRANSPORT is enabled, TCP targets are driven by the
+    // local Ascend-aware TCP source transport.
+    if ((preferred_proto == "tcp" || preferred_proto == "ascend_tcp") &&
+        std::find(protos.begin(), protos.end(), "tcp") != protos.end() &&
+        transport_map_.count("ascend_tcp")) {
+        preferred_proto = "ascend_tcp";
+    }
+#endif
     if (!transport_map_.count(preferred_proto)) {
         return Status::NotSupportedTransport("Transport " + preferred_proto +
                                              " not installed");
     }
+#ifdef USE_ASCEND_TCP_TRANSPORT
+    if (preferred_proto == "ascend_tcp" &&
+        std::find(protos.begin(), protos.end(), "tcp") != protos.end()) {
+        transport = transport_map_[preferred_proto].get();
+        return Status::OK();
+    }
+#endif
     if (std::find(protos.begin(), protos.end(), preferred_proto) ==
         protos.end()) {
         return Status::NotSupportedTransport(
@@ -510,7 +543,9 @@ Transport* MultiTransport::getTransport(const std::string& proto) {
 }
 
 bool MultiTransport::isTcpOnly() const {
-    return transport_map_.size() == 1 && transport_map_.count("tcp") == 1;
+    if (transport_map_.size() != 1) return false;
+    return transport_map_.count("tcp") == 1 ||
+           transport_map_.count("ascend_tcp") == 1;
 }
 
 std::vector<Transport*> MultiTransport::listTransports() {

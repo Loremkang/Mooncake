@@ -92,6 +92,8 @@ resources until the issue, such as a downed link, is resolved.
 ## Example: Transfer Engine Bench
 The sample program provided in `mooncake-transfer-engine/example/transfer_engine_bench.cpp` demonstrates the basic usage of Transfer Engine by repeatedly reading/writing data blocks from the DRAM of the target node to the initiator node through the Transfer Engine interface. It can also be used to measure read and write throughput. Currently, the Transfer Engine Bench tool supports RDMA and TCP protocols.
 
+For the PCLab 910C-H20 host DRAM TCP incast validation tool, see [PCLab Host TCP Incast Benchmark Design](pclab-host-tcp-incast-bench.md).
+
 After successfully compiling Transfer Engine, the test program `transfer_engine_bench` can be found in the `build/mooncake-transfer-engine/example` directory.
 
 1. **Start the `metadata` service.** This service is used for the centralized highly available management of various metadata for Mooncake, including the internal connection status of Transfer Engine. It is necessary to ensure that both the initiator and target nodes can smoothly access this metadata service, so pay attention to:

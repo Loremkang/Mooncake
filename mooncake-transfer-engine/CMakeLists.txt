@@ -36,8 +36,20 @@ if (USE_ASCEND)
                       )
 endif()
 
-if (USE_ASCEND_HETEROGENEOUS)
-  file(GLOB ASCEND_TOOLKIT_ROOT "/usr/local/Ascend/ascend-toolkit/latest/*-linux")
+if (USE_ASCEND_HETEROGENEOUS OR USE_ASCEND_TCP_TRANSPORT)
+  if(DEFINED ENV{ASCEND_HOME_PATH})
+    file(GLOB ASCEND_TOOLKIT_ROOT "$ENV{ASCEND_HOME_PATH}/*-linux")
+  else()
+    file(GLOB ASCEND_TOOLKIT_ROOT
+         "/usr/local/Ascend/ascend-toolkit/latest/*-linux")
+  endif()
+  if (NOT ASCEND_TOOLKIT_ROOT)
+    file(GLOB ASCEND_TOOLKIT_ROOT "/usr/local/Ascend/cann-*/*-linux")
+  endif()
+  if (NOT ASCEND_TOOLKIT_ROOT)
+    message(FATAL_ERROR "Ascend toolkit root not found")
+  endif()
+  list(GET ASCEND_TOOLKIT_ROOT 0 ASCEND_TOOLKIT_ROOT)
   set(ASCEND_INCLUDE_DIR "${ASCEND_TOOLKIT_ROOT}/include")
   include_directories(/usr/local/include
                       /usr/include

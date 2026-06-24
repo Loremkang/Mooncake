@@ -222,7 +222,8 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
 #endif
 
 #if defined(USE_CXL) && !defined(USE_ASCEND) && \
-    !defined(USE_ASCEND_HETEROGENEOUS)
+    !defined(USE_ASCEND_HETEROGENEOUS) &&      \
+    !defined(USE_ASCEND_TCP_TRANSPORT)
     if (std::getenv("MC_CXL_DEV_PATH") != nullptr) {
         Transport* cxl_transport =
             multi_transports_->installTransport("cxl", local_topology_);
@@ -266,6 +267,13 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
             multi_transports_->installTransport("ascend", local_topology_);
         if (!ascend_transport) {
             LOG(ERROR) << "Failed to install Ascend transport";
+            return -1;
+        }
+#elif defined(USE_ASCEND_TCP_TRANSPORT)
+        Transport* ascend_tcp_transport =
+            multi_transports_->installTransport("ascend_tcp", local_topology_);
+        if (!ascend_tcp_transport) {
+            LOG(ERROR) << "Failed to install Ascend TCP transport";
             return -1;
         }
 #elif defined(USE_MACA)
