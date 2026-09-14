@@ -17,6 +17,7 @@
 #include <bits/stdint-uintn.h>
 #include <glog/logging.h>
 #include <asio/ip/v6_only.hpp>
+#include <asio/steady_timer.hpp>
 
 #include <algorithm>
 #include <cassert>
@@ -48,6 +49,17 @@ static size_t getChunkSize() {
         return size_t(65536);  // 64KB default
     }();
     return val;
+}
+
+// Optional compatibility fence: a READ on the same TCP connection cannot
+// respond until the peer has processed the preceding WRITE (including HBM copy).
+// This uses the existing protocol, so the receiver need not be upgraded.
+static bool writeRemoteFenceEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("MC_TCP_WRITE_REMOTE_FENCE");
+        return value && std::string(value) == "1";
+    }();
+    return enabled;
 }
 
 struct SessionHeader {
@@ -312,6 +324,9 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
 
     std::shared_ptr<tcpsocket> socket_;
     SessionHeader header_;
+    SessionHeader fence_header_{};
+    char fence_byte_ = 0;
+    std::unique_ptr<asio::steady_timer> fence_timer_;
     uint64_t total_transferred_bytes_;
     char* local_buffer_;
     std::function<void(TransferStatusEnum)> on_finalize_;
@@ -461,6 +476,54 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
             });
     }
 
+    void finishWriteFence(bool success) {
+        if (fence_timer_) fence_timer_->cancel();
+        if (!success) {
+            asio::error_code ignored;
+            socket_->close(ignored);  // Never pool a partially consumed response.
+        }
+        auto self(shared_from_this());
+        asio::post(socket_->get_executor(),
+                   [this, self, success,
+                    on_finalize = std::move(on_finalize_),
+                    on_complete = std::move(on_complete_)]() {
+                       if (on_finalize)
+                           on_finalize(success ? TransferStatusEnum::COMPLETED
+                                               : TransferStatusEnum::FAILED);
+                       session_mutex_.unlock();
+                       if (on_complete) on_complete();
+                   });
+    }
+
+    void writeRemoteFence() {
+        auto self(shared_from_this());
+        fence_header_.addr = header_.addr;
+        fence_header_.size = htole64(1);
+        fence_header_.opcode = (uint8_t)TransferRequest::READ;
+        fence_timer_ = std::make_unique<asio::steady_timer>(socket_->get_executor());
+        fence_timer_->expires_after(std::chrono::seconds(30));
+        fence_timer_->async_wait([this, self](const asio::error_code& ec) {
+            if (!ec) {
+                LOG(ERROR) << "ClientSession: TCP remote WRITE fence timed out";
+                asio::error_code ignored;
+                socket_->close(ignored);
+            }
+        });
+        asio::async_write(
+            *socket_, asio::buffer(&fence_header_, sizeof(fence_header_)),
+            [this, self](const asio::error_code& ec, std::size_t size) {
+                if (ec || size != sizeof(fence_header_)) {
+                    finishWriteFence(false);
+                    return;
+                }
+                asio::async_read(
+                    *socket_, asio::buffer(&fence_byte_, 1),
+                    [this, self](const asio::error_code& ec, std::size_t size) {
+                        finishWriteFence(!ec && size == 1);
+                    });
+            });
+    }
+
     void writeBody() {
         auto self(shared_from_this());
         uint64_t size = le64toh(header_.size);
@@ -469,6 +532,10 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
         size_t buffer_size =
             std::min(getChunkSize(), size - total_transferred_bytes_);
         if (buffer_size == 0) {
+            if (size > 0 && writeRemoteFenceEnabled()) {
+                writeRemoteFence();
+                return;
+            }
             // Post cleanup to ensure it runs after callback returns
             asio::post(socket_->get_executor(),
                        [this, self, on_finalize = std::move(on_finalize_),
