@@ -26,9 +26,22 @@ def thread_counters():
         try:
             v = (p / 'stat').read_text().rsplit(')', 1)[1].split()
             result[p.name] = {'ticks': int(v[11]) + int(v[12]),
-                              'comm': (p / 'comm').read_text().strip()}
+                              'comm': (p / 'comm').read_text().strip(),
+                              'schedstat': [int(x) for x in (p/'schedstat').read_text().split()]}
         except FileNotFoundError:
             pass
+    return result
+
+
+def tcp_counters():
+    result = {}
+    for name in ('snmp', 'netstat'):
+        lines = Path('/proc/net', name).read_text().splitlines()
+        for header, values in zip(lines[::2], lines[1::2]):
+            for k, v in zip(header.split()[1:], values.split()[1:]):
+                if any(s in k for s in ('Retrans','Timeout','Reorder','DSACK','SACK',
+                                       'Loss','Backlog','Listen','WinProbe','Segs','RcvQDrop')):
+                    result[header.split()[0]+k] = int(v)
     return result
 
 
@@ -81,7 +94,8 @@ def receiver(args):
                     else:
                         ctypes.memset(ptr, 0, size)
                     prepared.update(pattern=pattern, iteration=d['iteration'],
-                                    counters=thread_counters())
+                                    counters=thread_counters(), real_ns=time.time_ns(),
+                                    mono_ns=time.monotonic_ns())
                     result = {'ready': True}
                 elif self.path == '/verify':
                     assert prepared and d['iteration'] == prepared['iteration']
@@ -100,8 +114,14 @@ def receiver(args):
                             break
                         time.sleep(.005)
                     result = {'ok': ok, 'iteration': prepared['iteration'],
+                              'receiver_prepare_real_ns': prepared['real_ns'],
+                              'receiver_verify_real_ns': time.time_ns(),
                               'verify_ms': (time.perf_counter()-start)*1000,
                               'verify_attempts': attempts,
+                              'receiver_thread_schedstat_delta': {
+                                  k: [x-y for x,y in zip(v['schedstat'],
+                                      prepared['counters'].get(k,v)['schedstat'])]
+                                  for k,v in before_verify.items()},
                               'receiver_threads_cpu_ms_before_verify': {
                                   k: {'comm': v['comm'], 'cpu_ms':
                                       (v['ticks']-prepared['counters'].get(k,{'ticks':v['ticks']})['ticks'])
@@ -154,20 +174,29 @@ def sender(args):
               'pool': os.environ.get('MC_TCP_ENABLE_CONNECTION_POOL', '0'),
               'bytes_per_iteration': size, 'rows': rows, 'complete': False}
     save(args.root/'result.json', result)
+    save(args.root/'sender-meta.json', {'pid':os.getpid(), 'session':session,
+                                      'real_ns':time.time_ns()})
     try:
         for i in range(args.warmup + args.iterations):
             pattern = i % 250 + 1
             ctypes.memset(ptr, pattern, size)
             request('/prepare', {'pattern': pattern, 'iteration': i})
+            tcp_before = tcp_counters()
+            real_start = time.time_ns()
             start = time.perf_counter()
             rc = engine.batch_transfer_sync_write(meta['session'], source, target,
                                                   [block_size]*args.blocks)
             api_ms = (time.perf_counter()-start)*1000
+            real_end = time.time_ns()
+            tcp_after = tcp_counters()
             if rc != 0:
                 raise RuntimeError(f'TE transfer error {rc}')
             check = request('/verify', {'iteration': i})
             confirmation_ms = (time.perf_counter()-start)*1000
             row = {'iteration':i, 'warmup':i<args.warmup, 'api_ms':api_ms,
+                   'sender_start_real_ns':real_start,'sender_end_real_ns':real_end,
+                   'sender_tcp_delta':{k:tcp_after[k]-v for k,v in tcp_before.items()
+                                       if tcp_after[k]!=v},
                    'confirmation_ms':confirmation_ms, **check}
             rows.append(row); save(args.root/'result.json', result)
             print(json.dumps(row), flush=True)
