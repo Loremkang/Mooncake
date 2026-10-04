@@ -71,7 +71,8 @@ def receiver(args):
             'blocks': args.blocks, 'block_mib': args.block_mib,
             'memory': args.memory, 'gpu': args.gpu, 'library': library,
             'chunk_size': os.environ.get('MC_TCP_SLICE_SIZE', '65536'),
-            'pool': os.environ.get('MC_TCP_ENABLE_CONNECTION_POOL', '0')}
+            'pool': os.environ.get('MC_TCP_ENABLE_CONNECTION_POOL', '0'),
+            'strict_verify': args.strict_verify}
     prepared = {}
     rows = []
 
@@ -110,7 +111,7 @@ def receiver(args):
                         else:
                             arr = np.ctypeslib.as_array(buf).view(np.uint8)
                         ok = bool(np.all(arr == prepared['pattern']))
-                        if ok or time.perf_counter() - start > 10:
+                        if ok or args.strict_verify or time.perf_counter() - start > 10:
                             break
                         time.sleep(.005)
                     result = {'ok': ok, 'iteration': prepared['iteration'],
@@ -160,6 +161,9 @@ def sender(args):
     meta = request('/')
     size = args.blocks * args.block_mib * 1024 * 1024
     assert meta['bytes'] == size and meta['blocks'] == args.blocks
+    assert not args.strict_verify or meta.get('strict_verify'), 'receiver must reject first mismatch'
+    if args.strict_verify:
+        assert os.environ.get('MC_TCP_WRITE_REMOTE_FENCE') == '1', 'correctness fence required'
     buf = ctypes.create_string_buffer(size)
     ptr = ctypes.addressof(buf)
     engine, session, library = initialize(args.local_ip)
@@ -172,6 +176,7 @@ def sender(args):
               'remote_fence': os.environ.get('MC_TCP_WRITE_REMOTE_FENCE', '0'),
               'sender_chunk': os.environ.get('MC_TCP_SLICE_SIZE', '65536'),
               'pool': os.environ.get('MC_TCP_ENABLE_CONNECTION_POOL', '0'),
+              'strict_verify': args.strict_verify, 'idle_ms': args.idle_ms,
               'bytes_per_iteration': size, 'rows': rows, 'complete': False}
     save(args.root/'result.json', result)
     save(args.root/'sender-meta.json', {'pid':os.getpid(), 'session':session,
@@ -200,8 +205,10 @@ def sender(args):
                    'confirmation_ms':confirmation_ms, **check}
             rows.append(row); save(args.root/'result.json', result)
             print(json.dumps(row), flush=True)
-            if not check['ok']:
-                raise RuntimeError('full-buffer verification failed')
+            if not check['ok'] or (args.strict_verify and check['verify_attempts'] != 1):
+                raise RuntimeError('first full-buffer verification failed')
+            if i + 1 < args.warmup + args.iterations:
+                time.sleep(args.idle_ms / 1000)
         measured = [r for r in rows if not r['warmup']]
         result['api_ms_median'] = statistics.median(r['api_ms'] for r in measured)
         result['api_ms_mean'] = statistics.mean(r['api_ms'] for r in measured)
@@ -233,7 +240,10 @@ if __name__ == '__main__':
     p.add_argument('--block-mib', type=int, default=9)
     p.add_argument('--warmup', type=int, default=2)
     p.add_argument('--iterations', type=int, default=8)
+    p.add_argument('--strict-verify', action='store_true')
+    p.add_argument('--idle-ms', type=int, default=0)
     a = p.parse_args()
+    assert 0 <= a.idle_ms <= 10000
     assert 0 < a.blocks*a.block_mib <= 600
     a.root.mkdir(parents=True, exist_ok=True)
     assert not (a.root/'result.json').exists(), 'preserve existing attempt'
