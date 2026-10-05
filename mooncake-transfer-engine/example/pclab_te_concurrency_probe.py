@@ -212,6 +212,15 @@ def sender(args):
         with opener.open(r, timeout=20) as response:
             return json.load(response)
 
+    def gate(path, data):
+        if not args.gate_url:
+            return None
+        data = dict(data, source=args.source_id)
+        r = urllib.request.Request(args.gate_url + path,
+              data=json.dumps(data).encode(), headers={'Content-Type': 'application/json'})
+        with opener.open(r, timeout=60) as response:
+            return json.load(response)
+
     meta = request('/')
     size = args.blocks * args.block_mib * 1024 * 1024
     assert (meta['bytes_per_writer'], meta['writers'], meta['blocks']) == (size, args.writers, args.blocks)
@@ -237,6 +246,10 @@ def sender(args):
                 for ptr, pattern in zip(pointers, patterns):
                     ctypes.memset(ptr, pattern, size)
                 request('/prepare', {'round': round_id, 'patterns': patterns})
+                # All source buffers are ready before the H20 coordinator opens
+                # this round; no full validation runs until all sources finish.
+                gate('/ready', {'round': round_id, 'bytes': size * args.writers,
+                                'warmup': round_id < args.warmup})
                 barrier = threading.Barrier(args.writers + 1)
 
                 def transfer(writer):
@@ -261,6 +274,9 @@ def sender(args):
                 completion_notice_ms = (time.perf_counter_ns() - min(w['start_mono_ns'] for w in writes)) / 1e6
                 if not notice['tail_ok']:
                     raise RuntimeError('remote layer-tail completion timeout')
+                global_round = gate('/complete', {'round': round_id,
+                                    'api_span_ms': span_ms,
+                                    'completion_notice_ms': completion_notice_ms})
                 verify = request('/verify', {'round': round_id})
                 record = {'round': round_id, 'warmup': round_id < args.warmup,
                           'span_ms': span_ms, 'aggregate_gbps': size * args.writers * 8 / span_ms / 1e6,
@@ -270,6 +286,8 @@ def sender(args):
                           'writes': writes, 'sender_threads': thread_delta(cpu_before, cpu_after),
                           'sender_host_tcp_delta': {k: tcp_after[k] - v for k, v in tcp_before.items() if tcp_after[k] != v},
                           **verify, 'receiver_threads_before_verify': notice['receiver_threads_before_verify']}
+                if global_round is not None:
+                    record['h20_coordinated_round'] = global_round
                 result['rounds'].append(record)
                 save(args.root / 'result.json', result)
                 print(json.dumps({k: record[k] for k in ('round', 'warmup', 'span_ms', 'aggregate_gbps', 'ok', 'verify_attempts')}), flush=True)
@@ -286,6 +304,10 @@ def sender(args):
                       mean_completion_notice_ms=statistics.mean(r['completion_notice_ms'] for r in measured))
     except BaseException as exc:
         result['failure'] = repr(exc)
+        try:
+            gate('/abort', {'error': repr(exc)})
+        except Exception:
+            pass
         raise
     finally:
         save(args.root / 'result.json', result)
@@ -312,6 +334,8 @@ def main():
     parser.add_argument('--iterations', type=int, default=6)
     parser.add_argument('--idle-ms', type=int, default=300)
     parser.add_argument('--start-delay', type=float, default=0, help='Attach external PID probes before load')
+    parser.add_argument('--gate-url', default='', help='Optional shared H20 multi-source round coordinator')
+    parser.add_argument('--source-id', type=int, default=0)
     args = parser.parse_args()
     assert 0 < args.blocks * args.block_mib * args.writers <= 1200
     assert 0 <= args.warmup <= 4 and 1 <= args.iterations <= 16
