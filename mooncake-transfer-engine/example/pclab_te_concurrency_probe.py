@@ -85,6 +85,18 @@ def receiver(args):
         buf = torch.zeros(total, dtype=torch.uint8, device=f'cuda:{args.gpu}')
         torch.cuda.synchronize()
         ptr = buf.data_ptr()
+        # Read the tail of every layer with one pitched D2H call per writer.
+        # TCP ServerSession copies each layer sequentially, so its tail arriving
+        # implies its preceding bytes have been copied. Full verification still
+        # follows, but no full-buffer D2H copy disturbs an incomplete transfer.
+        runtime_paths = {l.split()[-1] for l in Path('/proc/self/maps').read_text().splitlines()
+                         if '/libcudart.so' in l and not l.endswith('(deleted)')}
+        assert len(runtime_paths) == 1, runtime_paths
+        cudart = ctypes.CDLL(next(iter(runtime_paths)))
+        cudart.cudaMemcpy2D.argtypes = [ctypes.c_void_p, ctypes.c_size_t,
+            ctypes.c_void_p, ctypes.c_size_t, ctypes.c_size_t, ctypes.c_size_t, ctypes.c_int]
+        cudart.cudaMemcpy2D.restype = ctypes.c_int
+        tail_buf = ctypes.create_string_buffer(args.blocks * 8)
     else:
         buf = ctypes.create_string_buffer(total)
         ptr = ctypes.addressof(buf)
@@ -121,8 +133,34 @@ def receiver(args):
                     active.update(round=data['round'], patterns=data['patterns'], before=threads())
                     assert len(active['patterns']) == args.writers
                     self.reply({'ready': True})
+                elif self.path == '/await-complete':
+                    assert active and active['round'] == data['round']
+                    start = time.perf_counter_ns()
+                    attempts = 0
+                    block = args.block_mib * 1024 * 1024
+                    while True:
+                        attempts += 1
+                        checks = []
+                        for w, pattern in enumerate(active['patterns']):
+                            if args.memory == 'cuda':
+                                rc = cudart.cudaMemcpy2D(ctypes.addressof(tail_buf), 8,
+                                    ptr + w * size + block - 8, block, 8, args.blocks, 2)
+                                assert rc == 0, ('cudaMemcpy2D', rc)
+                                checks.append(tail_buf.raw == bytes([pattern]) * (args.blocks * 8))
+                            else:
+                                checks.append(all(ctypes.string_at(ptr + w * size + (i + 1) * block - 8, 8)
+                                    == bytes([pattern]) * 8 for i in range(args.blocks)))
+                        if all(checks) or time.perf_counter_ns() - start > 10e9:
+                            break
+                        time.sleep(.001)
+                    notice = {'tail_ok': all(checks), 'tail_attempts': attempts,
+                              'tail_wait_ms': (time.perf_counter_ns() - start) / 1e6,
+                              'receiver_threads_before_verify': thread_delta(active['before'], threads())}
+                    active['tail_complete'] = notice['tail_ok']
+                    self.reply(notice)
                 elif self.path == '/verify':
                     assert active and active['round'] == data['round']
+                    assert active.get('tail_complete'), 'observe all layer tails first'
                     cpu = thread_delta(active['before'], threads())
                     start = time.perf_counter_ns()
                     attempts = 0
@@ -134,9 +172,7 @@ def receiver(args):
                             arr = np.ctypeslib.as_array(buf).view(np.uint8)
                         checks = [bool(np.all(arr[w * size:(w + 1) * size] == pattern))
                                   for w, pattern in enumerate(active['patterns'])]
-                        if all(checks) or (time.perf_counter_ns() - start) > 10e9:
-                            break
-                        time.sleep(.005)
+                        break  # Every-byte verification must pass on its first try.
                     record = {'round': active['round'], 'ok': all(checks), 'checks': checks,
                               'verify_attempts': attempts,
                               'verify_ms': (time.perf_counter_ns() - start) / 1e6,
@@ -221,12 +257,19 @@ def sender(args):
                 writes = [f.result(timeout=45) for f in futures]
                 cpu_after, tcp_after = threads(), tcp_counters()
                 span_ms = (max(w['end_mono_ns'] for w in writes) - min(w['start_mono_ns'] for w in writes)) / 1e6
+                notice = request('/await-complete', {'round': round_id})
+                completion_notice_ms = (time.perf_counter_ns() - min(w['start_mono_ns'] for w in writes)) / 1e6
+                if not notice['tail_ok']:
+                    raise RuntimeError('remote layer-tail completion timeout')
                 verify = request('/verify', {'round': round_id})
                 record = {'round': round_id, 'warmup': round_id < args.warmup,
                           'span_ms': span_ms, 'aggregate_gbps': size * args.writers * 8 / span_ms / 1e6,
+                          'completion_notice_ms': completion_notice_ms,
+                          'completion_notice_gbps': size * args.writers * 8 / completion_notice_ms / 1e6,
+                          'tail_attempts': notice['tail_attempts'], 'tail_wait_ms': notice['tail_wait_ms'],
                           'writes': writes, 'sender_threads': thread_delta(cpu_before, cpu_after),
                           'sender_host_tcp_delta': {k: tcp_after[k] - v for k, v in tcp_before.items() if tcp_after[k] != v},
-                          **verify}
+                          **verify, 'receiver_threads_before_verify': notice['receiver_threads_before_verify']}
                 result['rounds'].append(record)
                 save(args.root / 'result.json', result)
                 print(json.dumps({k: record[k] for k in ('round', 'warmup', 'span_ms', 'aggregate_gbps', 'ok', 'verify_attempts')}), flush=True)
@@ -237,7 +280,10 @@ def sender(args):
         result.update(complete=True, mean_span_ms=statistics.mean(r['span_ms'] for r in measured),
                       median_span_ms=statistics.median(r['span_ms'] for r in measured),
                       aggregate_gbps=size * args.writers * 8 * len(measured) / sum(r['span_ms'] for r in measured) / 1e6,
-                      mean_writer_api_ms=statistics.mean(w['api_ms'] for r in measured for w in r['writes']))
+                      mean_writer_api_ms=statistics.mean(w['api_ms'] for r in measured for w in r['writes']),
+                      completion_notice_gbps=size * args.writers * 8 * len(measured)
+                        / sum(r['completion_notice_ms'] for r in measured) / 1e6,
+                      mean_completion_notice_ms=statistics.mean(r['completion_notice_ms'] for r in measured))
     except BaseException as exc:
         result['failure'] = repr(exc)
         raise
